@@ -5,6 +5,7 @@
 # - .sh runner (Git Bash), .py runner (native Python), .bat/.cmd runner
 # - apt/dpkg SIMULATION (scripts/resources only), metadata & ownership simulation
 # - Migrates automatically from old KRNL_System layout to LinuxFS
+# - Pretty help with sections/columns/examples
 
 import os
 import sys
@@ -17,7 +18,6 @@ import tarfile
 import lzma
 import gzip
 import urllib.request
-import zipfile
 from pathlib import Path
 from datetime import datetime
 from io import BytesIO
@@ -234,14 +234,13 @@ def ensure_git_bash() -> str | None:
     # 3) Download PortableGit and extract (self-extracting .7z.exe)
     try:
         print(f"{c(C_YELLOW)}Downloading Portable Git Bash...{c(C_RESET)}")
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
         sfx_path = CACHE_DIR / "PortableGit.7z.exe"
         if not sfx_path.exists():
             http_download_to(sfx_path, PORTABLE_GIT_URL)
         # Extract to GIT_HOME using SFX flags: -y (assume yes) -o (output dir)
         GIT_HOME.mkdir(parents=True, exist_ok=True)
-        # Use quotes in case of spaces
-        proc = subprocess.run([str(sfx_path), "-y", f"-o{str(GIT_HOME)}"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        proc = subprocess.run([str(sfx_path), "-y", f"-o{str(GIT_HOME)}"],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if proc.returncode != 0:
             print(f"{c(C_RED)}PortableGit extraction failed{c(C_RESET)}\n{proc.stderr}")
             return None
@@ -698,6 +697,111 @@ def find_python() -> str | None:
 
     return None
 
+# ---------- help pretty-print ----------
+def _pad_cols(rows, gap=2):
+    """Netjes in kolommen uitlijnen."""
+    if not rows: return []
+    cols = max(len(r) for r in rows)
+    widths = [0]*cols
+    for r in rows:
+        for i,cell in enumerate(r):
+            widths[i] = max(widths[i], len(cell))
+    out = []
+    for r in rows:
+        line = ""
+        for i,cell in enumerate(r):
+            if i < cols-1:
+                line += cell.ljust(widths[i] + gap)
+            else:
+                line += cell
+        out.append(line.rstrip())
+    return out
+
+def print_help():
+    root = str(SYSTEM_ROOT).replace("\\", "/")
+    reg  = str(APT_REGISTRY).replace("\\", "/")
+
+    sections = []
+
+    # Header
+    sections += [[f"{BRAND} {VERSION} — commands overview"],
+                 [f"Root: {root}"],
+                 [f"Registry: {reg}"],
+                 [""]]
+
+    # Navigatie / weergave
+    nav_rows = [
+        ["pwd",                       "toon huidige directory"],
+        ["ls [-a] [-l] [-h] [pad]",  "lijst inhoud (dotfiles -a, long -l, human -h)"],
+        ["cd [dir]",                  "ga naar map (zonder arg → ~/)"],
+        ["tree",                      "boomweergave submappen"],
+    ]
+    sections += [["— Navigatie & weergave —"]]
+    sections += _pad_cols(nav_rows)
+
+    # Bestanden & zoeken
+    file_rows = [
+        ["mkdir <dir>",                   "maak map (recursief)"],
+        ["touch <file>",                  "maak lege file / update mtime"],
+        ["cat <file>",                    "print bestand"],
+        ["echo TEXT [> file|>> file]",    "print/append naar bestand"],
+        ["rm [-r] [-f] <pad>",            "verwijder (mappen met -r)"],
+        ["cp [-r] <src>... <dst>",        "kopie (mappen met -r)"],
+        ["mv <src>... <dst>",             "verplaats/hernoem"],
+        ["grep [-i] [-r] PATTERN [FILE...]","zoek in tekstbestanden"],
+    ]
+    sections += [[""], ["— Bestanden & zoeken —"]]
+    sections += _pad_cols(file_rows)
+
+    # Systeem & hulpprogramma’s
+    sys_rows = [
+        ["chmod MODE FILE...",            "sim: bewaar modus in metadata"],
+        ["chown OWNER[:GROUP] FILE...",   "sim: bewaar eigenaar/groep in metadata"],
+        ["which <cmd>",                   "toon pad naar host-commando"],
+        ["whoami",                        "toon gebruikersnaam"],
+        ["clear",                         "scherm leegmaken"],
+        ["exit",                          "afsluiten"],
+    ]
+    sections += [[""], ["— Systeem & hulpprogramma’s —"]]
+    sections += _pad_cols(sys_rows)
+
+    # Pakketbeheer & tools
+    pkg_rows = [
+        ["apt install <pkg>",  "SIM: download & pak .deb uit (scripts/resources)"],
+        ["apt remove <pkg>",   "SIM: verwijder geïnstalleerde files"],
+        ["dpkg -i FILE.deb",   "SIM: installeer lokaal .deb"],
+        ["dpkg -r <pkg>",      "SIM: verwijder pakket"],
+        ["sudo <cmd>",         "SIM: voert cmd uit zonder echte privileges"],
+        ["git ...",            "Echt: gebruikt Git (portable of systeem)"],
+        ["python/py/pip/pip3", "Echt: mappen naar host-tools (auto-deps)"],
+    ]
+    sections += [[""], ["— Pakketbeheer & tools —"]]
+    sections += _pad_cols(pkg_rows)
+
+    # Voorbeelden
+    ex_rows = [
+        ["Voorbeelden:", ""],
+        ["  ls -al /usr/bin",                        ""],
+        ["  echo 'hello' > notes.txt",               ""],
+        ["  grep -r token ./project",                ""],
+        ["  apt install examplepkg",                 "(voeg .deb URL toe in registry)"],
+        ["  git clone https://github.com/user/repo", ""],
+        ["  ./script.sh",                            "(draait via Git Bash, met python3-shim)"],
+    ]
+    sections += [[""], ["— Voorbeelden —"]]
+    sections += _pad_cols(ex_rows)
+
+    # Waarschuwing
+    sections += [[""],
+                 ["⚠️  Linux-binaries uit .deb draaien niet op Windows; scripts/bronbestanden wel."],
+                 ["   Git Bash en Python worden automatisch gevonden/ingesteld (portable indien nodig)."]]
+
+    for line in sections:
+        if isinstance(line, list):
+            print(line[0] if line else "")
+        else:
+            print(line)
+
 # ---------- dispatcher ----------
 def run_command(line: str, cwd: Path) -> Path:
     if not line.strip(): return cwd
@@ -737,18 +841,7 @@ def run_command(line: str, cwd: Path) -> Path:
             print(f"{indent}{Path(root).name}/"); [print(f"{indent}  {f}") for f in files]
         return cwd
     elif cmd == "help":
-        print("Available commands:")
-        print("  ls [-a] [-l] [-h] [path]")
-        print("  cd [dir]     pwd")
-        print("  mkdir <dir>  touch <file>  cat <file>")
-        print("  echo TEXT [> file | >> file]")
-        print("  rm [-r] [-f] <path>    cp [-r] <src>... <dst>    mv <src>... <dst>")
-        print("  grep [-i] [-r] PATTERN [FILE...]")
-        print("  chmod MODE FILE...   (sim)   chown OWNER[:GROUP] FILE...   (sim)")
-        print("  which <cmd>   whoami   clear   tree   help   exit")
-        print("  apt install <pkg>    apt remove <pkg>    dpkg -i FILE.deb    dpkg -r <pkg>   (SIMULATION)")
-        print(f"Registry: {APT_REGISTRY} (add packages + .deb URL here)")
-        print("⚠️  Linux binaries from .deb will not run on Windows; scripts/resources do.")
+        print_help()
         return cwd
     elif cmd == "rm": cmd_rm(cwd, args); return cwd
     elif cmd == "cp": cmd_cp(cwd, args); return cwd
@@ -803,7 +896,6 @@ def run_command(line: str, cwd: Path) -> Path:
 
             # .sh → run in Git Bash with python auto-detect + SHELL SHIM + PATH prep
             if host.lower().endswith(".sh"):
-                # ensure deps
                 ensure_pip_deps()
                 bash = find_bash()
                 if not bash:
@@ -869,14 +961,12 @@ def run_command(line: str, cwd: Path) -> Path:
         real = shutil.which("git")
         if not real:
             # try Portable Git if auto-downloaded
-            bash_path = ensure_git_bash() if AUTO_DOWNLOAD_TOOLS else None
-            # git.exe is alongside PortableGit's `mingw64/bin/git.exe` (or cmd/git.exe)
-            possible = [
+            _ = ensure_git_bash() if AUTO_DOWNLOAD_TOOLS else None
+            for p in [
                 GIT_HOME / "cmd" / "git.exe",
                 GIT_HOME / "mingw64" / "bin" / "git.exe",
                 GIT_HOME / "mingw32" / "bin" / "git.exe",
-            ]
-            for p in possible:
+            ]:
                 if p.exists():
                     real = str(p); break
 
