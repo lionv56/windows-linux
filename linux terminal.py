@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-# Linux Terminal v3.6 – Virtual Linux-like shell for Windows (LinuxFS root)
-# - Auto-detect Python + python3 shell-shim for Git Bash
+# Linux Terminal v3.7 – Virtual Linux-like shell for Windows (LinuxFS root)
+# - Auto-setup: pip deps + auto-download Portable Git Bash if missing
+# - Auto-detect Python + python3 shell-shim (bash script) for Git Bash
 # - .sh runner (Git Bash), .py runner (native Python), .bat/.cmd runner
 # - apt/dpkg SIMULATION (scripts/resources only), metadata & ownership simulation
 # - Migrates automatically from old KRNL_System layout to LinuxFS
@@ -16,9 +17,20 @@ import tarfile
 import lzma
 import gzip
 import urllib.request
+import zipfile
 from pathlib import Path
 from datetime import datetime
 from io import BytesIO
+
+# ===================== CONFIG =====================
+# Portable Git (self-extracting 7z) – update URL if needed:
+PORTABLE_GIT_URL = (
+    "https://github.com/git-for-windows/git/releases/download/v2.45.2.windows.1/"
+    "PortableGit-2.45.2-64-bit.7z.exe"
+)
+AUTO_DOWNLOAD_TOOLS = True  # zet op False om auto-download te voorkomen
+REQUIRED_PIP_PACKAGES = ["colorama"] + (["pyreadline3"] if os.name == "nt" else [])
+# ==================================================
 
 # ---------- color ----------
 try:
@@ -49,9 +61,13 @@ META_FILE    = SYSTEM_ROOT / ".linux_meta.json"
 PKG_DB_FILE  = SYSTEM_ROOT / ".linux_packages.json"
 APT_REGISTRY = SYSTEM_ROOT / "etc" / "linux_apt_registry.json"
 
+TOOLS_DIR    = SYSTEM_ROOT / "tools"
+GIT_HOME     = TOOLS_DIR / "git"     # waar PortableGit komt te staan
+CACHE_DIR    = SYSTEM_ROOT / "var" / "cache" / "downloads"
+
 # Branding
 BRAND    = "Linux Terminal"
-VERSION  = "v3.6"
+VERSION  = "v3.7"
 HOSTNAME = "linux"
 
 USER    = os.getenv("USER") or os.getenv("USERNAME") or "user"
@@ -138,8 +154,8 @@ def init_system():
     for d in [
         f"home/{USER}", "root",
         "usr/bin", "usr/lib", "usr/share",
-        "etc", "var/log", "var/tmp",
-        "bin", "tmp"
+        "etc", "var/log", "var/tmp", "var/cache/downloads",
+        "bin", "tmp", "tools"
     ]:
         (SYSTEM_ROOT / d).mkdir(parents=True, exist_ok=True)
 
@@ -160,8 +176,83 @@ def init_system():
     if not PKG_DB_FILE.exists():
         json_save(PKG_DB_FILE, {"installed": {}})
 
-def is_initialized() -> bool:
-    return INIT_MARKER.exists()
+# ---------- dependency bootstrap ----------
+def pip_install(package: str):
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", package])
+        return True
+    except Exception:
+        return False
+
+def ensure_pip_deps():
+    missing = []
+    for pkg in REQUIRED_PIP_PACKAGES:
+        try:
+            __import__(pkg.split("==")[0].split(">=")[0])
+        except Exception:
+            missing.append(pkg)
+    if not missing:
+        return
+    print(f"{c(C_YELLOW)}Installing Python packages: {', '.join(missing)} ...{c(C_RESET)}")
+    ok_all = True
+    for pkg in missing:
+        ok = pip_install(pkg)
+        ok_all = ok_all and ok
+    if not ok_all:
+        print(f"{c(C_RED)}Warning:{c(C_RESET)} Some Python packages failed to install. Continue anyway...")
+
+def http_download_to(path: Path, url: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with urllib.request.urlopen(url) as resp, open(path, "wb") as f:
+        shutil.copyfileobj(resp, f)
+
+def find_portable_git_bash_in(git_root: Path) -> str | None:
+    candidates = [
+        git_root / "usr" / "bin" / "bash.exe",
+        git_root / "bin" / "bash.exe",
+    ]
+    for cnd in candidates:
+        if cnd.exists():
+            return str(cnd)
+    return None
+
+def ensure_git_bash() -> str | None:
+    # 1) Already present in tools?
+    bash = find_portable_git_bash_in(GIT_HOME)
+    if bash:
+        return bash
+
+    # 2) System Git?
+    sys_bash = shutil.which("bash")
+    if sys_bash:
+        return sys_bash
+
+    if not AUTO_DOWNLOAD_TOOLS:
+        print(f"{c(C_YELLOW)}Git Bash not found. AUTO_DOWNLOAD_TOOLS is disabled.{c(C_RESET)}")
+        return None
+
+    # 3) Download PortableGit and extract (self-extracting .7z.exe)
+    try:
+        print(f"{c(C_YELLOW)}Downloading Portable Git Bash...{c(C_RESET)}")
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        sfx_path = CACHE_DIR / "PortableGit.7z.exe"
+        if not sfx_path.exists():
+            http_download_to(sfx_path, PORTABLE_GIT_URL)
+        # Extract to GIT_HOME using SFX flags: -y (assume yes) -o (output dir)
+        GIT_HOME.mkdir(parents=True, exist_ok=True)
+        # Use quotes in case of spaces
+        proc = subprocess.run([str(sfx_path), "-y", f"-o{str(GIT_HOME)}"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if proc.returncode != 0:
+            print(f"{c(C_RED)}PortableGit extraction failed{c(C_RESET)}\n{proc.stderr}")
+            return None
+        bash = find_portable_git_bash_in(GIT_HOME)
+        if bash:
+            print(f"{c(C_GREEN)}Portable Git Bash installed to {GIT_HOME}{c(C_RESET)}")
+            return bash
+    except Exception as e:
+        print(f"{c(C_RED)}Failed to auto-install Git Bash:{c(C_RESET)} {e}")
+        return None
+    return None
 
 # ---------- path helpers ----------
 def resolve_path(cwd: Path, arg: str) -> Path:
@@ -535,8 +626,14 @@ def win_to_msys_path(win_path: str) -> str:
     return p
 
 def find_bash() -> str | None:
+    # Prefer Portable Git in tools
+    bash = find_portable_git_bash_in(GIT_HOME)
+    if bash:
+        return bash
+    # Fallback to system
     p = shutil.which("bash")
     if p: return p
+    # Try common installs
     for c in (r"C:\Program Files\Git\bin\bash.exe",
               r"C:\Program Files\Git\usr\bin\bash.exe",
               r"C:\Program Files (x86)\Git\bin\bash.exe",
@@ -706,15 +803,20 @@ def run_command(line: str, cwd: Path) -> Path:
 
             # .sh → run in Git Bash with python auto-detect + SHELL SHIM + PATH prep
             if host.lower().endswith(".sh"):
+                # ensure deps
+                ensure_pip_deps()
                 bash = find_bash()
                 if not bash:
-                    print("bash: not found. Install Git for Windows (Git Bash) and put it in PATH.")
-                    return cwd
+                    if AUTO_DOWNLOAD_TOOLS:
+                        bash = ensure_git_bash()
+                    if not bash:
+                        print("bash: not found and auto-install failed. Install Git for Windows (Portable or full).")
+                        return cwd
 
                 pyexe = find_python()
                 msys_script = win_to_msys_path(host)
 
-                # clean PATH (remove WindowsApps)
+                # clean PATH (remove WindowsApps aliases)
                 env = os.environ.copy()
                 env["PATH"] = os.pathsep.join([p for p in env.get("PATH","").split(os.pathsep) if "WindowsApps" not in p])
 
@@ -744,6 +846,7 @@ def run_command(line: str, cwd: Path) -> Path:
 
             # .py → run with detected Python
             if host.lower().endswith(".py"):
+                ensure_pip_deps()
                 pyexe = find_python()
                 if pyexe:
                     run_host_process([pyexe, host], cwd)
@@ -762,7 +865,21 @@ def run_command(line: str, cwd: Path) -> Path:
 
     # git
     if cmd == "git":
+        ensure_pip_deps()
         real = shutil.which("git")
+        if not real:
+            # try Portable Git if auto-downloaded
+            bash_path = ensure_git_bash() if AUTO_DOWNLOAD_TOOLS else None
+            # git.exe is alongside PortableGit's `mingw64/bin/git.exe` (or cmd/git.exe)
+            possible = [
+                GIT_HOME / "cmd" / "git.exe",
+                GIT_HOME / "mingw64" / "bin" / "git.exe",
+                GIT_HOME / "mingw32" / "bin" / "git.exe",
+            ]
+            for p in possible:
+                if p.exists():
+                    real = str(p); break
+
         if real:
             host_args = map_args_virtual_to_host(cwd, args)
             try:
@@ -780,14 +897,15 @@ def run_command(line: str, cwd: Path) -> Path:
                 (target / "README.txt").write_text(
                     f"Dummy clone of {url}\n(No real git available)\n", encoding="utf-8"
                 )
-                print(f"Cloning into '{name}'...\nDone (dummy). Install Git for real cloning: https://git-scm.com/downloads")
+                print(f"Cloning into '{name}'...\nDone (dummy). Install Git or enable AUTO_DOWNLOAD_TOOLS.")
             else:
-                print("git: command not found (install Git or use WSL).")
+                print("git: command not found (install Git or enable AUTO_DOWNLOAD_TOOLS).")
         return cwd
 
     # fallback host tools
     real_cmd = shutil.which(ALIASES.get(cmd, cmd))
     if real_cmd:
+        ensure_pip_deps()
         mapped = map_args_virtual_to_host(cwd, [ALIASES.get(cmd, cmd)] + args)
         try:
             p = subprocess.Popen(mapped, cwd=str(cwd))
@@ -803,9 +921,14 @@ def main():
     migrate_from_krnl_if_needed()
 
     first = False
-    if not SYSTEM_ROOT.exists() or not is_initialized():
+    if not SYSTEM_ROOT.exists() or not INIT_MARKER.exists():
         first = True
         init_system()
+
+    # Ensure core deps up-front so first run is smooth
+    ensure_pip_deps()
+    if AUTO_DOWNLOAD_TOOLS and not find_bash():
+        ensure_git_bash()  # best effort; als het faalt, wordt later nog gemeld
 
     header = "Initializing virtual Linux system..." if first else "Virtual system mounted"
     print(f"{c(C_CYAN)}{BRAND} {VERSION} – {header}{c(C_RESET)}\n")
